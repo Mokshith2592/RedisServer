@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 
 #include "../include/RedisServer.h"
+#include "../include/RedisCommandHandler.h"
+
 using namespace std;
 
 static RedisServer* globalServer = nullptr;
@@ -46,4 +48,38 @@ void RedisServer::run() {
     }
 
     cout << "Redis Server Listining On Port " << port << "\n";
+
+    vector<thread> threads;
+    RedisCommandHandler cmdHandler;
+
+    while(running) {
+        int client_socket = accept(server_socket ,nullptr ,nullptr);
+        if(client_socket < 0 ) {
+            if(running) cerr << "Error Accepting Client Connection\n";
+            break;
+        }
+
+        threads.emplace_back([client_socket ,&cmdHandler](){
+            char buffer[1024];
+
+            while(true) {
+                memset(buffer ,0 ,sizeof(buffer));
+
+                int bytes = recv(client_socket ,buffer ,sizeof(buffer)-1 ,0);
+                if(bytes <= 0) break;
+
+                string request(buffer ,bytes);
+                string response = cmdHandler.processCommand(request);
+
+                send(client_socket ,response.c_str() ,response.size() ,0);
+            }
+            close(client_socket);
+        });
+    }
+
+    for(auto &t : threads) {
+        if(t.joinable()) t.join();
+    }
+
+    //Shutdown
 }

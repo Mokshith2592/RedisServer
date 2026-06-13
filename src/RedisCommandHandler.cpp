@@ -59,3 +59,19 @@ vector<string> parseRespCommand(const string &input) {
 }
 
 RedisCommandHandler::RedisCommandHandler() {}
+
+string RedisCommandHandler::processCommand(const string &commandLine) {
+    // Use RESP Parser
+    vector<string> tokens = parseRespCommand(commandLine);
+    if(tokens.empty()) return "-Error: Empty Command\r\n";
+
+    string cmd = tokens[0];
+    transform(cmd.begin() ,cmd.end() ,cmd.begin() ,::toupper);
+
+    ostringstream response;
+
+    // Connect to Database
+
+    // Check commands
+    return response.str();
+} 
