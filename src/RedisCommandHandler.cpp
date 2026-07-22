@@ -2,6 +2,7 @@
 using namespace std;
 
 #include "../include/RedisCommandHandler.h"
+#include "../include/RedisDatabase.h"
 
 // RESP(Redis Serialization Protocol) parser: 
 // *2\r\n$4\r\n\PING\r\n$4\r\TEST\r\n
@@ -56,6 +57,8 @@ vector<string> parseRespCommand(const string &input) {
 
         pos += (len + 2);
     }
+
+    return tokens;
 }
 
 RedisCommandHandler::RedisCommandHandler() {}
@@ -65,13 +68,26 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
     vector<string> tokens = parseRespCommand(commandLine);
     if(tokens.empty()) return "-Error: Empty Command\r\n";
 
+    cout << commandLine << "\n";
+    for(auto &t : tokens) cout << t << "\n";
+
     string cmd = tokens[0];
     transform(cmd.begin() ,cmd.end() ,cmd.begin() ,::toupper);
 
     ostringstream response;
 
-    // Connect to Database
+    RedisDatabase &db = RedisDatabase::getInstance();
 
     // Check commands
+    if(cmd == "PING") {
+        response << "+PONG\r\n";
+    }
+    else if(cmd == "ECHO") {
+
+    }
+    else {
+        response << "-Error : Unknown command\r\n";
+    }
+
     return response.str();
 } 

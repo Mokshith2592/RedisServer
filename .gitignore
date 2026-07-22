@@ -9,3 +9,5 @@ build/
 RedisClient
 
 *.d
+
+threads.cpp

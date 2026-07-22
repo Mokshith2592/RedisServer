@@ -16,6 +16,9 @@ class RedisServer {
         int port;
         int server_socket;
         atomic<bool> running;
+
+        //Setup signal handling for graceful shutdown
+        void setupSignalHandler();
 };
 
 #endif 
