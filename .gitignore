@@ -11,3 +11,5 @@ RedisClient
 *.d
 
 threads.cpp
+
+my_redis_server

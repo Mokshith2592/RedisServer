@@ -18,6 +18,11 @@ class RedisDatabase {
         ~RedisDatabase() = default;
         RedisDatabase(const RedisDatabase&) = delete;
         RedisDatabase& operator = (const RedisDatabase&) = delete;
+
+        mutex db_mutex;
+        unordered_map<string ,string> kv_store;
+        unordered_map<string ,vector<string>> list_store;
+        unordered_map<string ,unordered_map<string ,string>> hash_store;
 };
 
 #endif
