@@ -9,6 +9,18 @@ class RedisDatabase {
         // Get the singleton instance
         static RedisDatabase& getInstance();
 
+        //Common commands
+        bool flushAll();
+
+        //Key-Value Operations
+        void set(const string &key ,const string &value);
+        bool get(const string &key ,const string &value);
+        vector<string> keys();
+        string type(const string &key);
+        bool del(const string &key);
+        bool expire(const string &key ,const string &seconds);
+        bool rename(const string &oldKey ,const string &newKey);
+        
         //Persistance: Dump / load the database from a file
         bool dump(const string& filename);
         bool load(const string& filename);
@@ -23,6 +35,8 @@ class RedisDatabase {
         unordered_map<string ,string> kv_store;
         unordered_map<string ,vector<string>> list_store;
         unordered_map<string ,unordered_map<string ,string>> hash_store;
+
+        unordered_map<string ,chrono::steady_clock::time_point> expiry_map;
 };
 
 #endif
