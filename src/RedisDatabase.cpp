@@ -175,3 +175,77 @@ vector<string> RedisDatabase::keys() {
         result.push_back(pair.first);
     }
 }
+
+string RedisDatabase::type(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(kv_store.find(key) != kv_store.end()) return "string";
+    else if(list_store.find(key) != list_store.end()) return "list";
+    else if(hash_store.find(key) != hash_store.end()) return "hash";
+    else return "none";
+}
+
+bool RedisDatabase::del(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    bool erased = false;
+    erased |= (kv_store.erase(key) > 0);
+    erased |= (list_store.erase(key) > 0);
+    erased |= (hash_store.erase(key) > 0);
+
+    return erased;
+}
+
+bool RedisDatabase::expire(const string &key ,int seconds) {
+    lock_guard<mutex> lock(db_mutex);
+
+    bool exist = (kv_store.find(key) != kv_store.end()) ||
+                (list_store.find(key) != list_store.end()) ||
+                (hash_store.find(key) != hash_store.end());
+
+    if(!exist) return false;
+
+    expiry_map[key] = chrono::steady_clock::now() + chrono::seconds(seconds);
+    return true;
+}
+
+bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
+    lock_guard<mutex> lock(db_mutex);
+
+    const bool exists = kv_store.count(oldKey) || list_store.count(oldKey) ||
+                        hash_store.count(oldKey);
+    if(!exists) return false;
+
+    if(oldKey == newKey) return true;
+    
+    kv_store.erase(newKey);
+    list_store.erase(newKey);
+    hash_store.erase(newKey);
+    expiry_map.erase(newKey);
+
+    auto itrKv = kv_store.find(oldKey);
+    if(itrKv != kv_store.end()) {
+        kv_store.emplace(newKey, move(itrKv->second));
+        kv_store.erase(itrKv);
+    }
+
+    auto itrList = list_store.find(oldKey);
+    if(itrList != list_store.end()) {
+        list_store.emplace(newKey, move(itrList->second));
+        list_store.erase(itrList);
+    }
+
+    auto itrHash = hash_store.find(oldKey);
+    if(itrHash != hash_store.end()) {
+        hash_store.emplace(newKey, move(itrHash->second));
+        hash_store.erase(itrHash);
+    }
+
+    auto itrExpiry = expiry_map.find(oldKey);
+    if(itrExpiry != expiry_map.end()) {
+        expiry_map.emplace(newKey, itrExpiry->second);
+        expiry_map.erase(itrExpiry);
+    }
+
+    return true;
+}

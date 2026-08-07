@@ -18,7 +18,7 @@ class RedisDatabase {
         vector<string> keys();
         string type(const string &key);
         bool del(const string &key);
-        bool expire(const string &key ,const string &seconds);
+        bool expire(const string &key ,int seconds);
         bool rename(const string &oldKey ,const string &newKey);
         
         //Persistance: Dump / load the database from a file

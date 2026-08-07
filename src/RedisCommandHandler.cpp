@@ -143,7 +143,7 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
         if(tokens.size() < 3) 
             response << "-Error: EXPIRE reuires key and time(seconds)\r\n";
         else {
-            if(db.expire(tokens[1] ,tokens[2]))
+            if(db.expire(tokens[1] ,stoi(tokens[2])))
                 response << "+OK\r\n";
         }
     }
