@@ -68,9 +68,6 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
     vector<string> tokens = parseRespCommand(commandLine);
     if(tokens.empty()) return "-Error: Empty Command\r\n";
 
-    cout << commandLine << "\n";
-    for(auto &t : tokens) cout << t << "\n";
-
     string cmd = tokens[0];
     transform(cmd.begin() ,cmd.end() ,cmd.begin() ,::toupper);
 
@@ -153,10 +150,12 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
         else {
             if(db.rename(tokens[1] ,tokens[2]))
                 response << "+OK\r\n";
+            else
+                response << "-Error: no such key\r\n";
         }
     }
     else
         response << "-Error : Unknown command\r\n";
 
     return response.str();
-} 
+}

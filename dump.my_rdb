@@ -1,0 +1,11 @@
+K name Alice
+K city Berlin
+K country Germany
+K language English
+K role developer
+K status active
+K theme dark
+K timezone UTC
+K milk 19924
+L fruits apple banana orange
+H user:100 name:Bob age:30 email:bob@example.com
