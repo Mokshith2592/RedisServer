@@ -174,6 +174,8 @@ vector<string> RedisDatabase::keys() {
     for(const auto &pair : hash_store) {
         result.push_back(pair.first);
     }
+
+    return result;
 }
 
 string RedisDatabase::type(const string &key) {
@@ -217,7 +219,7 @@ bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
     if(!exists) return false;
 
     if(oldKey == newKey) return true;
-    
+
     kv_store.erase(newKey);
     list_store.erase(newKey);
     hash_store.erase(newKey);
