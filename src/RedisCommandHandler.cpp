@@ -100,8 +100,10 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
         if(tokens.size() < 3) 
             response << "-Error: SET reuires key and value\r\n";
         else {
-            db.set(tokens[1] ,tokens[2]);
-            response << "+OK\r\n";
+            if(db.set(tokens[1] ,tokens[2]))
+                response << "+OK\r\n";
+            else 
+                response << "$-1\r\n";
         }
     }
     else if(cmd == "GET") {

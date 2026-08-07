@@ -124,3 +124,54 @@ bool RedisDatabase::load(const string& filename) {
     }
     return true;
 }
+
+//Key - Value Operations
+bool RedisDatabase::flushAll() {
+    lock_guard<mutex> lock(db_mutex);
+
+    kv_store.clear();
+    list_store.clear();
+    hash_store.clear();
+
+    return true;
+}
+
+bool RedisDatabase::set(const string &key ,const string &value) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(kv_store.count(key)) {
+        cerr << "The key: " << key << " is already present in database\n";
+        return false;
+    }
+
+    kv_store[key] = value;
+    return true;
+}
+
+bool RedisDatabase::get(const string &key ,string &value) {
+    lock_guard<mutex> lock(db_mutex);
+
+    auto itr = kv_store.find(key);
+    if(itr == kv_store.end()) {
+        cerr << "The key: " << key << " is not present in database\n";
+        return false;
+    }
+
+    value = itr -> second;
+    return true;
+}
+
+vector<string> RedisDatabase::keys() {
+    lock_guard<mutex> lock(db_mutex);
+
+    vector<string> result;
+    for(const auto &pair : kv_store) {
+        result.push_back(pair.first);
+    }
+    for(const auto &pair : list_store) {
+        result.push_back(pair.first);
+    }
+    for(const auto &pair : hash_store) {
+        result.push_back(pair.first);
+    }
+}

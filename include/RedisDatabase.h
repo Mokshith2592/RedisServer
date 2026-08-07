@@ -13,8 +13,8 @@ class RedisDatabase {
         bool flushAll();
 
         //Key-Value Operations
-        void set(const string &key ,const string &value);
-        bool get(const string &key ,const string &value);
+        bool set(const string &key ,const string &value);
+        bool get(const string &key ,string &value);
         vector<string> keys();
         string type(const string &key);
         bool del(const string &key);
