@@ -154,6 +154,14 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
                 response << "-Error: no such key\r\n";
         }
     }
+    else if(cmd == "DUMP") {
+        if(db.dump("dump.my_rdb")) response << "+OK\r\n";
+        else response << "-Unable to dump\r\n";
+    }
+    else if(cmd == "LOAD") {
+        if(db.load("dump.my_rdb")) response << "+OK\r\n";
+        else response << "-Unable to load\r\n";
+    }
     else
         response << "-Error : Unknown command\r\n";
 

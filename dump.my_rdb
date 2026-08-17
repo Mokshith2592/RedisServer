@@ -1,12 +1,11 @@
-K milk 10
-K surname gattu
-K timezone UTC
-K theme dark
-K status active
-K role developer
-K language English
-K country Germany
 K city Berlin
-K name Alice
+K country Germany
+K language English
+K status active
+K theme dark
+K mobiles 10
+K surname gattu
+K milk 10
+K size 18
 L fruits apple banana orange
-H user:100 email:bob@example.com age:30 name:Bob
+H user:100 name:Bob age:30 email:bob@example.com

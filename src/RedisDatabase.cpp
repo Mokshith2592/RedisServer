@@ -90,6 +90,7 @@ bool RedisDatabase::load(const string& filename) {
             iss >> key >> value;
 
             kv_store[key] = value;
+            type_store[key] = RedisType::STRING;
         }
         else if(type == 'L') {
             string key;
@@ -101,6 +102,7 @@ bool RedisDatabase::load(const string& filename) {
                 list.push_back(item);
 
             list_store[key] = list;
+            type_store[key] = RedisType::LIST;
         }
         else if(type == 'H') {
             string key;
@@ -120,18 +122,39 @@ bool RedisDatabase::load(const string& filename) {
             }
 
             hash_store[key] = hash;
+            type_store[key] = RedisType::HASH;
         }
     }
     return true;
 }
 
 //Key - Value Operations
+
+//Helper fns
+string RedisDatabase::getString(RedisType type) {
+    if(type == RedisType::STRING) return "String";
+    else if(type == RedisType::LIST) return "List";
+    else if(type == RedisType::HASH) return "Hash";
+    else return "none";
+}
+
+bool RedisDatabase::checkExpiry(const string &key) {
+    if(expiry_map.find(key) != expiry_map.end() &&
+        expiry_map[key] <= chrono::steady_clock::now()) {
+        if(deleteUnlocked(key)) return true;
+        else return false;
+    }
+    return false;
+}
+
 bool RedisDatabase::flushAll() {
     lock_guard<mutex> lock(db_mutex);
 
     kv_store.clear();
     list_store.clear();
     hash_store.clear();
+    expiry_map.clear();
+    type_store.clear();
 
     return true;
 }
@@ -139,17 +162,38 @@ bool RedisDatabase::flushAll() {
 bool RedisDatabase::set(const string &key ,const string &value) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(kv_store.count(key)) {
-        cerr << "The key: " << key << " is already present in database\n";
+    if((type_store.find(key) != type_store.end() && type_store[key] == RedisType::STRING) || 
+        (type_store.find(key) == type_store.end())) {
+        kv_store[key] = value;
+        type_store[key] = RedisType::STRING;
+
+        return true;
+    }  
+    else {
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
         return false;
     }
-
-    kv_store[key] = value;
-    return true;
 }
 
 bool RedisDatabase::get(const string &key ,string &value) {
     lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return false;
+    }
+
+    if(type_store.find(key) != type_store.end()) {
+        string type = getString(type_store[key]);
+        if(type == "List") {
+            cerr << "The key: " << key << " is present as a List\n";
+            return false;
+        }
+        else if(type == "hash") {
+            cerr << "The key: " << key << " is present as a hash\n";
+            return false;
+        }
+    }
 
     auto itr = kv_store.find(key);
     if(itr == kv_store.end()) {
@@ -181,21 +225,32 @@ vector<string> RedisDatabase::keys() {
 string RedisDatabase::type(const string &key) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(kv_store.find(key) != kv_store.end()) return "string";
-    else if(list_store.find(key) != list_store.end()) return "list";
-    else if(hash_store.find(key) != hash_store.end()) return "hash";
-    else return "none";
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return "none";
+    }
+
+    string ans = "";
+    if(type_store.find(key) != type_store.end()) ans = getString(type_store[key]);
+    else ans = "none";
+
+    return ans;
 }
 
-bool RedisDatabase::del(const string &key) {
-    lock_guard<mutex> lock(db_mutex);
-
+bool RedisDatabase::deleteUnlocked(const string &key) {
     bool erased = false;
     erased |= (kv_store.erase(key) > 0);
     erased |= (list_store.erase(key) > 0);
     erased |= (hash_store.erase(key) > 0);
+    erased |= (expiry_map.erase(key) > 0);
+    erased |= (type_store.erase(key) > 0);
 
     return erased;
+}
+
+bool RedisDatabase::del(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+    return deleteUnlocked(key);    
 }
 
 bool RedisDatabase::expire(const string &key ,int seconds) {
@@ -213,6 +268,11 @@ bool RedisDatabase::expire(const string &key ,int seconds) {
 
 bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
     lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(oldKey)) {
+        cerr << oldKey << " is expired\n";
+        return false;
+    }
 
     const bool exists = kv_store.count(oldKey) || list_store.count(oldKey) ||
                         hash_store.count(oldKey);
