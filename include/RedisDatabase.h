@@ -32,6 +32,14 @@ class RedisDatabase {
         bool checkExpiry(const string& key);
         string getString(RedisType type);
 
+        //List Operations
+        string lpush(const string &key ,const vector<string> &values);
+        string rpush(const string &key ,const vector<string> &values);
+        string lpop(const string &key);
+        string rpop(const string &key);
+        string llen(const string &key);
+        bool lrange(const string &key ,const int start ,const int end ,vector<string> &values);
+
         //Persistance: Dump / load the database from a file
         bool dump(const string& filename);
         bool load(const string& filename);
@@ -44,7 +52,7 @@ class RedisDatabase {
 
         mutex db_mutex;
         unordered_map<string ,string> kv_store;
-        unordered_map<string ,vector<string>> list_store;
+        unordered_map<string ,deque<string>> list_store;
         unordered_map<string ,unordered_map<string ,string>> hash_store;
 
         unordered_map<string ,chrono::steady_clock::time_point> expiry_map;

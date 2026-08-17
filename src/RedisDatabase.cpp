@@ -77,6 +77,9 @@ bool RedisDatabase::load(const string& filename) {
     kv_store.clear();
     list_store.clear();
     hash_store.clear();
+    expiry_map.clear();
+    type_store.clear();
+
 
     string line;
     while(getline(ifs ,line)) {
@@ -97,7 +100,7 @@ bool RedisDatabase::load(const string& filename) {
             iss >> key;
 
             string item;
-            vector<string> list;
+            deque<string> list;
             while(iss >> item) 
                 list.push_back(item);
 
@@ -132,9 +135,9 @@ bool RedisDatabase::load(const string& filename) {
 
 //Helper fns
 string RedisDatabase::getString(RedisType type) {
-    if(type == RedisType::STRING) return "String";
-    else if(type == RedisType::LIST) return "List";
-    else if(type == RedisType::HASH) return "Hash";
+    if(type == RedisType::STRING) return "string";
+    else if(type == RedisType::LIST) return "list";
+    else if(type == RedisType::HASH) return "hash";
     else return "none";
 }
 
@@ -185,7 +188,7 @@ bool RedisDatabase::get(const string &key ,string &value) {
 
     if(type_store.find(key) != type_store.end()) {
         string type = getString(type_store[key]);
-        if(type == "List") {
+        if(type == "list") {
             cerr << "The key: " << key << " is present as a List\n";
             return false;
         }
@@ -209,13 +212,17 @@ vector<string> RedisDatabase::keys() {
     lock_guard<mutex> lock(db_mutex);
 
     vector<string> result;
-    for(const auto &pair : kv_store) {
-        result.push_back(pair.first);
-    }
-    for(const auto &pair : list_store) {
-        result.push_back(pair.first);
-    }
-    for(const auto &pair : hash_store) {
+    // for(const auto &pair : kv_store) {
+    //     result.push_back(pair.first);
+    // }
+    // for(const auto &pair : list_store) {
+    //     result.push_back(pair.first);
+    // }
+    // for(const auto &pair : hash_store) {
+    //     result.push_back(pair.first);
+    // }
+
+    for(auto &pair : type_store) {
         result.push_back(pair.first);
     }
 
@@ -256,9 +263,7 @@ bool RedisDatabase::del(const string &key) {
 bool RedisDatabase::expire(const string &key ,int seconds) {
     lock_guard<mutex> lock(db_mutex);
 
-    bool exist = (kv_store.find(key) != kv_store.end()) ||
-                (list_store.find(key) != list_store.end()) ||
-                (hash_store.find(key) != hash_store.end());
+    bool exist = (type_store.find(key) != type_store.end());
 
     if(!exist) return false;
 
@@ -284,23 +289,30 @@ bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
     list_store.erase(newKey);
     hash_store.erase(newKey);
     expiry_map.erase(newKey);
+    type_store.erase(newKey);
 
     auto itrKv = kv_store.find(oldKey);
     if(itrKv != kv_store.end()) {
         kv_store.emplace(newKey, move(itrKv->second));
         kv_store.erase(itrKv);
+
+        type_store[newKey] = RedisType::STRING;
     }
 
     auto itrList = list_store.find(oldKey);
     if(itrList != list_store.end()) {
         list_store.emplace(newKey, move(itrList->second));
         list_store.erase(itrList);
+
+        type_store[newKey] = RedisType::LIST;
     }
 
     auto itrHash = hash_store.find(oldKey);
     if(itrHash != hash_store.end()) {
         hash_store.emplace(newKey, move(itrHash->second));
         hash_store.erase(itrHash);
+
+        type_store[newKey] = RedisType::HASH;
     }
 
     auto itrExpiry = expiry_map.find(oldKey);
@@ -310,4 +322,168 @@ bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
     }
 
     return true;
+}
+
+//List Operations
+string RedisDatabase::lpush(const string &key ,const vector<string> &values) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return "0";
+    }
+
+    if(((type_store.find(key) != type_store.end()) && (type_store[key] == RedisType::LIST)) || 
+            (type_store.find(key) == type_store.end())) {
+        deque<string> &currValues = list_store[key];
+        
+        for(const string &i : values) currValues.push_front(i);
+        type_store[key] = RedisType::LIST;
+
+        return to_string(currValues.size());
+    }
+
+    if(type_store[key] != RedisType::LIST) 
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
+
+    return "0";
+}
+
+string RedisDatabase::rpush(const string &key ,const vector<string> &values) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return "0";
+    }
+
+    if(((type_store.find(key) != type_store.end()) && (type_store[key] == RedisType::LIST)) || 
+            (type_store.find(key) == type_store.end())) {
+        deque<string> &currValues = list_store[key];
+        
+        for(const string &i : values) currValues.push_back(i);
+        type_store[key] = RedisType::LIST;
+
+        return to_string(currValues.size());
+    }
+
+    if(type_store[key] != RedisType::LIST) 
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
+        
+    return "0";
+}
+
+string RedisDatabase::lpop(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return "0";
+    }
+
+    if((type_store.find(key) == type_store.end())) {
+        cerr << "The key " << key << " does not exisit\r\n";
+        return "0";
+    }
+    
+    if(type_store[key] != RedisType::LIST) {
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
+        return "0";
+    }
+
+    deque<string> &currValue = list_store[key];
+    if(currValue.size() > 0) {
+        currValue.pop_front();
+        if(currValue.size()  == 0) deleteUnlocked(key);
+    }
+    else {
+        cerr << "The key " << key << " doesnt have enough elements\r\n";
+        return "-1";
+    }
+
+    return to_string(currValue.size());
+}
+
+string RedisDatabase::rpop(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return "0";
+    }
+
+    if((type_store.find(key) == type_store.end())) {
+        cerr << "The key " << key << " does not exisit\r\n";
+        return "0";
+    }
+
+    if(type_store[key] != RedisType::LIST) {
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
+        return "0";
+    }
+
+    deque<string> &currValue = list_store[key];
+    if(currValue.size() > 0) {
+        currValue.pop_back();
+        if(currValue.size()  == 0) deleteUnlocked(key);
+    }
+    else {
+        cerr << "The key " << key << " doesnt have enough elements\r\n";
+        return "-1";
+    }
+
+    return to_string(currValue.size());
+}
+
+string RedisDatabase::llen(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return "0";
+    }
+
+    if((type_store.find(key) != type_store.end()) && (type_store[key] != RedisType::LIST)) {
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
+        return "0";
+    }
+
+    if(type_store.find(key) != type_store.end()) return to_string(list_store[key].size());
+    return "0";
+}
+
+bool RedisDatabase::lrange(const string &key ,const int start ,const int end ,vector<string> &values) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(checkExpiry(key)) {
+        cerr << key << " is expired\n";
+        return false;
+    }
+
+    if((type_store.find(key) != type_store.end()) && (type_store[key] != RedisType::LIST)) {
+        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
+        return false;
+    }
+
+    if(type_store.find(key) != type_store.end()) {
+        deque<string> &currValues = list_store[key];
+        
+        int size = currValues.size();
+        if(start < 0 || end > size || start > end) {
+            cerr << "The range doesnot exists\r\n";
+            return false;
+        }
+
+        for(int i=start ;i<=end ;i++) {
+            values.push_back(currValues[i]);
+        }
+
+        return true;
+    }
+    else {
+        cerr << "The key " << key << " does not exists\r\n";
+        return false;
+    }
+
+    return false;
 }

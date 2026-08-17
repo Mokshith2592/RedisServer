@@ -162,6 +162,79 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
         if(db.load("dump.my_rdb")) response << "+OK\r\n";
         else response << "-Unable to load\r\n";
     }
+
+    //List Commands
+    else if(cmd == "LPUSH") {
+        if(tokens.size() < 3) 
+            response << "-Error: LPUSH reuires key and values\r\n";
+        else {
+            vector<string> values;
+
+            for(int i=2 ;i<int(tokens.size()) ;i++) values.push_back(tokens[i]);
+            string updatedSize = db.lpush(tokens[1] ,values);
+            
+            if(stoi(updatedSize) > 0) response <<":" << updatedSize << "\r\n";
+            else response << "-Unable to append the values\r\n";
+        } 
+    }
+    else if(cmd == "RPUSH") {
+        if(tokens.size() < 3) 
+            response << "-Error: RPUSH reuires key and values\r\n";
+        else {
+            vector<string> values;
+
+            for(int i=2 ;i<int(tokens.size()) ;i++) values.push_back(tokens[i]);
+            string updatedSize = db.rpush(tokens[1] ,values);
+            
+            if(stoi(updatedSize) > 0) response << ":" << updatedSize << "\r\n";
+            else response << "-Unable to append the values\r\n";
+        } 
+    }
+    else if(cmd == "LPOP") {
+        if(tokens.size() < 2) 
+            response << "-Error: LPOP reuires a key\r\n";
+        else {
+            string updatedSize = db.lpop(tokens[1]);
+            
+            if(stoi(updatedSize) >= 0) response << ":" << updatedSize << "\r\n";
+            else response << "-Unable to pop the value from front\r\n";
+        }
+    }
+    else if(cmd == "RPOP") {
+        if(tokens.size() < 2) 
+            response << "-Error: RPUSH reuires a key\r\n";
+        else {
+            string updatedSize = db.rpop(tokens[1]);
+            
+            if(stoi(updatedSize) >= 0) response << ":" << updatedSize << "\r\n";
+            else response << "-Unable to pop the value from back\r\n";
+        }
+        
+    }
+    else if(cmd == "LLEN") {
+        if(tokens.size() < 2) 
+            response << "-Error: LLEN reuires key\r\n";
+        else {
+            string updatedSize = db.llen(tokens[1]);
+            
+            if(stoi(updatedSize) >= 0) response << ":" << updatedSize << "\r\n";
+            else response << "-Unable to get the length of the key\r\n";
+        }
+    }
+    else if(cmd == "LRANGE") {
+        if(tokens.size() != 4) 
+            response << "-Error: LRANGE reuires a key and start and end indices\r\n";
+        else {
+            vector<string> values;
+            if(db.lrange(tokens[1] ,stoi(tokens[2]) ,stoi(tokens[3]) ,values)) {
+                response << "*" << values.size() << "\r\n";
+
+                for(const auto &key : values) {
+                    response << "$" << key.size() << "\r\n" << key << "\r\n";
+                }
+            }
+        }
+    }
     else
         response << "-Error : Unknown command\r\n";
 

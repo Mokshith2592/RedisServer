@@ -1,11 +1,9 @@
 K city Berlin
 K country Germany
 K language English
-K status active
+K name Mokshith
 K theme dark
-K mobiles 10
-K surname gattu
 K milk 10
 K size 18
-L fruits apple banana orange
+L fruits strawberry banana apple banana orange
 H user:100 name:Bob age:30 email:bob@example.com
