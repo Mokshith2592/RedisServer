@@ -1,0 +1,15 @@
+*.exe
+*.o
+*.obj
+*.out
+build/
+
+.vscode/
+
+RedisClient
+
+*.d
+
+threads.cpp
+
+my_redis_server
