@@ -27,5 +27,18 @@ int main() {
     tests.expect(handler.processCommand("DEL user") == ":1\r\n", "deletes a key");
     tests.expect(handler.processCommand("DEL user") == ":0\r\n", "reports a missing key on DEL");
 
+    tests.expect(handler.processCommand("HSET user name Alice role admin") == ":2\r\n", "sets multiple hash fields");
+    tests.expect(handler.processCommand("HGET user name") == "$5\r\nAlice\r\n", "gets a hash field");
+    tests.expect(handler.processCommand("HMGET user role missing") == "*2\r\n$5\r\nadmin\r\n$-1\r\n",
+                 "gets multiple hash fields");
+    tests.expect(handler.processCommand("HLEN user") == ":2\r\n", "counts hash fields");
+    tests.expect(handler.processCommand("HGETALL user") == "*4\r\n$4\r\nname\r\n$5\r\nAlice\r\n$4\r\nrole\r\n$5\r\nadmin\r\n",
+                 "serializes hash fields as RESP");
+
+    tests.expect(handler.processCommand("RPUSH queue first second third") == ":3\r\n", "pushes list values");
+    tests.expect(handler.processCommand("LINDEX queue -1") == "$5\r\nthird\r\n", "indexes a list value");
+    tests.expect(handler.processCommand("LREM queue 1 second") == ":1\r\n", "removes list values");
+    tests.expect(handler.processCommand("LTRIM queue 0 0") == "+OK\r\n", "trims a list");
+
     return tests.result();
 }

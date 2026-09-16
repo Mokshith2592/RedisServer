@@ -165,8 +165,7 @@ bool RedisDatabase::flushAll() {
 bool RedisDatabase::set(const string &key ,const string &value) {
     lock_guard<mutex> lock(db_mutex);
 
-    if((type_store.find(key) != type_store.end() && type_store[key] == RedisType::STRING) || 
-        (type_store.find(key) == type_store.end())) {
+    if(type_store.find(key) == type_store.end()) {
         kv_store[key] = value;
         type_store[key] = RedisType::STRING;
 
@@ -468,22 +467,170 @@ bool RedisDatabase::lrange(const string &key ,const int start ,const int end ,ve
     if(type_store.find(key) != type_store.end()) {
         deque<string> &currValues = list_store[key];
         
-        int size = currValues.size();
-        if(start < 0 || end > size || start > end) {
-            cerr << "The range doesnot exists\r\n";
-            return false;
-        }
+        const int size = static_cast<int>(currValues.size());
+        int first = start < 0 ? size + start : start;
+        int last = end < 0 ? size + end : end;
+        first = max(0, first);
+        last = min(size - 1, last);
+        if(first > last || first >= size) return true;
 
-        for(int i=start ;i<=end ;i++) {
+        for(int i=first ;i<=last ;i++) {
             values.push_back(currValues[i]);
         }
 
         return true;
     }
-    else {
-        cerr << "The key " << key << " does not exists\r\n";
-        return false;
-    }
+    return true; // Redis returns an empty array for a missing list key.
 
-    return false;
+}
+
+bool RedisDatabase::lindex(const string &key, int index, string &value) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return false;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end() || typeIt->second != RedisType::LIST) return false;
+
+    const deque<string> &list = list_store[key];
+    const int resolved = index < 0 ? static_cast<int>(list.size()) + index : index;
+    if(resolved < 0 || resolved >= static_cast<int>(list.size())) return false;
+    value = list[resolved];
+    return true;
+}
+
+bool RedisDatabase::lset(const string &key, int index, const string &value) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return false;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end() || typeIt->second != RedisType::LIST) return false;
+
+    deque<string> &list = list_store[key];
+    const int resolved = index < 0 ? static_cast<int>(list.size()) + index : index;
+    if(resolved < 0 || resolved >= static_cast<int>(list.size())) return false;
+    list[resolved] = value;
+    return true;
+}
+
+int RedisDatabase::lrem(const string &key, int count, const string &value) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return 0;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end() || typeIt->second != RedisType::LIST) return 0;
+
+    deque<string> &list = list_store[key];
+    int removed = 0;
+    if(count >= 0) {
+        for(auto it = list.begin(); it != list.end() && (count == 0 || removed < count); ) {
+            if(*it == value) { it = list.erase(it); ++removed; } else ++it;
+        }
+    } else {
+        for(auto it = list.end(); it != list.begin() && removed < -count; ) {
+            --it;
+            if(*it == value) { it = list.erase(it); ++removed; }
+        }
+    }
+    if(list.empty()) deleteUnlocked(key);
+    return removed;
+}
+
+bool RedisDatabase::ltrim(const string &key, int start, int end) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return true;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end()) return true;
+    if(typeIt->second != RedisType::LIST) return false;
+
+    deque<string> &list = list_store[key];
+    const int size = static_cast<int>(list.size());
+    int first = start < 0 ? size + start : start;
+    int last = end < 0 ? size + end : end;
+    first = max(0, first);
+    last = min(size - 1, last);
+    if(first > last || first >= size) { deleteUnlocked(key); return true; }
+    list.erase(list.begin() + last + 1, list.end());
+    list.erase(list.begin(), list.begin() + first);
+    return true;
+}
+
+// Hash Operations
+bool RedisDatabase::hset(const string &key, const vector<pair<string, string>> &fieldValues, int &added) {
+    lock_guard<mutex> lock(db_mutex);
+    added = 0;
+    if(checkExpiry(key)) { /* expired keys are recreated below */ }
+    auto typeIt = type_store.find(key);
+    if(typeIt != type_store.end() && typeIt->second != RedisType::HASH) return false;
+
+    unordered_map<string, string> &hash = hash_store[key];
+    for(const auto &fieldValue : fieldValues) {
+        if(hash.find(fieldValue.first) == hash.end()) ++added;
+        hash[fieldValue.first] = fieldValue.second;
+    }
+    type_store[key] = RedisType::HASH;
+    return true;
+}
+
+bool RedisDatabase::hget(const string &key, const string &field, string &value) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return false;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end() || typeIt->second != RedisType::HASH) return false;
+    auto fieldIt = hash_store[key].find(field);
+    if(fieldIt == hash_store[key].end()) return false;
+    value = fieldIt->second;
+    return true;
+}
+
+int RedisDatabase::hdel(const string &key, const vector<string> &fields) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return 0;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end() || typeIt->second != RedisType::HASH) return 0;
+    unordered_map<string, string> &hash = hash_store[key];
+    int removed = 0;
+    for(const string &field : fields) removed += hash.erase(field) > 0;
+    if(hash.empty()) deleteUnlocked(key);
+    return removed;
+}
+
+bool RedisDatabase::hexists(const string &key, const string &field, bool &exists) {
+    lock_guard<mutex> lock(db_mutex);
+    exists = false;
+    if(checkExpiry(key)) return true;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end()) return true;
+    if(typeIt->second != RedisType::HASH) return false;
+    exists = hash_store[key].find(field) != hash_store[key].end();
+    return true;
+}
+
+int RedisDatabase::hlen(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return 0;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end() || typeIt->second != RedisType::HASH) return 0;
+    return static_cast<int>(hash_store[key].size());
+}
+
+bool RedisDatabase::hgetall(const string &key, vector<pair<string, string>> &fieldValues) {
+    lock_guard<mutex> lock(db_mutex);
+    if(checkExpiry(key)) return true;
+    auto typeIt = type_store.find(key);
+    if(typeIt == type_store.end()) return true;
+    if(typeIt->second != RedisType::HASH) return false;
+    for(const auto &fieldValue : hash_store[key]) fieldValues.push_back(fieldValue);
+    sort(fieldValues.begin(), fieldValues.end());
+    return true;
+}
+
+bool RedisDatabase::hkeys(const string &key, vector<string> &fields) {
+    vector<pair<string, string>> fieldValues;
+    if(!hgetall(key, fieldValues)) return false;
+    for(const auto &fieldValue : fieldValues) fields.push_back(fieldValue.first);
+    return true;
+}
+
+bool RedisDatabase::hvals(const string &key, vector<string> &values) {
+    vector<pair<string, string>> fieldValues;
+    if(!hgetall(key, fieldValues)) return false;
+    for(const auto &fieldValue : fieldValues) values.push_back(fieldValue.second);
+    return true;
 }

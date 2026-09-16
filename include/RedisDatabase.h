@@ -39,6 +39,20 @@ class RedisDatabase {
         string rpop(const string &key);
         string llen(const string &key);
         bool lrange(const string &key ,const int start ,const int end ,vector<string> &values);
+        bool lindex(const string &key, int index, string &value);
+        bool lset(const string &key, int index, const string &value);
+        int lrem(const string &key, int count, const string &value);
+        bool ltrim(const string &key, int start, int end);
+
+        //Hash Operations
+        bool hset(const string &key, const vector<pair<string, string>> &fieldValues, int &added);
+        bool hget(const string &key, const string &field, string &value);
+        int hdel(const string &key, const vector<string> &fields);
+        bool hexists(const string &key, const string &field, bool &exists);
+        int hlen(const string &key);
+        bool hgetall(const string &key, vector<pair<string, string>> &fieldValues);
+        bool hkeys(const string &key, vector<string> &fields);
+        bool hvals(const string &key, vector<string> &values);
 
         //Persistance: Dump / load the database from a file
         bool dump(const string& filename);

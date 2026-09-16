@@ -74,6 +74,11 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
     ostringstream response;
 
     RedisDatabase &db = RedisDatabase::getInstance();
+    auto writeArray = [&response](const vector<string> &values) {
+        response << "*" << values.size() << "\r\n";
+        for(const string &value : values)
+            response << "$" << value.size() << "\r\n" << value << "\r\n";
+    };
 
     // Check commands
 
@@ -227,11 +232,93 @@ string RedisCommandHandler::processCommand(const string &commandLine) {
         else {
             vector<string> values;
             if(db.lrange(tokens[1] ,stoi(tokens[2]) ,stoi(tokens[3]) ,values)) {
-                response << "*" << values.size() << "\r\n";
-
-                for(const auto &key : values) {
-                    response << "$" << key.size() << "\r\n" << key << "\r\n";
+                writeArray(values);
+            }
+            else response << "-Error: key is not a list\r\n";
+        }
+    }
+    else if(cmd == "LINDEX") {
+        if(tokens.size() != 3) response << "-Error: LINDEX requires key and index\r\n";
+        else {
+            string value;
+            if(db.lindex(tokens[1], stoi(tokens[2]), value)) response << "$" << value.size() << "\r\n" << value << "\r\n";
+            else response << "$-1\r\n";
+        }
+    }
+    else if(cmd == "LSET") {
+        if(tokens.size() != 4) response << "-Error: LSET requires key, index and value\r\n";
+        else if(db.lset(tokens[1], stoi(tokens[2]), tokens[3])) response << "+OK\r\n";
+        else response << "-Error: no such list element\r\n";
+    }
+    else if(cmd == "LREM") {
+        if(tokens.size() != 4) response << "-Error: LREM requires key, count and value\r\n";
+        else response << ":" << db.lrem(tokens[1], stoi(tokens[2]), tokens[3]) << "\r\n";
+    }
+    else if(cmd == "LTRIM") {
+        if(tokens.size() != 4) response << "-Error: LTRIM requires key, start and stop\r\n";
+        else if(db.ltrim(tokens[1], stoi(tokens[2]), stoi(tokens[3]))) response << "+OK\r\n";
+        else response << "-Error: key is not a list\r\n";
+    }
+    // Hash Commands
+    else if(cmd == "HSET" || cmd == "HMSET") {
+        if(tokens.size() < 4 || tokens.size() % 2 != 0)
+            response << "-Error: " << cmd << " requires key and field/value pairs\r\n";
+        else {
+            vector<pair<string, string>> fieldValues;
+            for(size_t i = 2; i < tokens.size(); i += 2) fieldValues.emplace_back(tokens[i], tokens[i + 1]);
+            int added = 0;
+            if(!db.hset(tokens[1], fieldValues, added)) response << "-Error: key is not a hash\r\n";
+            else if(cmd == "HMSET") response << "+OK\r\n";
+            else response << ":" << added << "\r\n";
+        }
+    }
+    else if(cmd == "HGET") {
+        if(tokens.size() != 3) response << "-Error: HGET requires key and field\r\n";
+        else {
+            string value;
+            if(db.hget(tokens[1], tokens[2], value)) response << "$" << value.size() << "\r\n" << value << "\r\n";
+            else response << "$-1\r\n";
+        }
+    }
+    else if(cmd == "HMGET") {
+        if(tokens.size() < 3) response << "-Error: HMGET requires key and fields\r\n";
+        else {
+            response << "*" << tokens.size() - 2 << "\r\n";
+            for(size_t i = 2; i < tokens.size(); ++i) {
+                string value;
+                if(db.hget(tokens[1], tokens[i], value)) response << "$" << value.size() << "\r\n" << value << "\r\n";
+                else response << "$-1\r\n";
+            }
+        }
+    }
+    else if(cmd == "HDEL") {
+        if(tokens.size() < 3) response << "-Error: HDEL requires key and fields\r\n";
+        else response << ":" << db.hdel(tokens[1], vector<string>(tokens.begin() + 2, tokens.end())) << "\r\n";
+    }
+    else if(cmd == "HEXISTS") {
+        if(tokens.size() != 3) response << "-Error: HEXISTS requires key and field\r\n";
+        else {
+            bool exists = false;
+            if(db.hexists(tokens[1], tokens[2], exists)) response << ":" << (exists ? 1 : 0) << "\r\n";
+            else response << "-Error: key is not a hash\r\n";
+        }
+    }
+    else if(cmd == "HLEN") {
+        if(tokens.size() != 2) response << "-Error: HLEN requires key\r\n";
+        else response << ":" << db.hlen(tokens[1]) << "\r\n";
+    }
+    else if(cmd == "HGETALL" || cmd == "HKEYS" || cmd == "HVALS") {
+        if(tokens.size() != 2) response << "-Error: " << cmd << " requires key\r\n";
+        else {
+            vector<pair<string, string>> fieldValues;
+            if(!db.hgetall(tokens[1], fieldValues)) response << "-Error: key is not a hash\r\n";
+            else {
+                vector<string> values;
+                for(const auto &fieldValue : fieldValues) {
+                    if(cmd == "HGETALL") { values.push_back(fieldValue.first); values.push_back(fieldValue.second); }
+                    else values.push_back(cmd == "HKEYS" ? fieldValue.first : fieldValue.second);
                 }
+                writeArray(values);
             }
         }
     }

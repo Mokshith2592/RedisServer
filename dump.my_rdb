@@ -1,9 +1,9 @@
-K city Berlin
-K country Germany
-K language English
-K name Mokshith
-K theme dark
-K milk 10
 K size 18
+K milk 10
+K theme dark
+K name Mokshith
+K language English
+K country Germany
+K city Berlin
 L fruits strawberry banana apple banana orange
-H user:100 name:Bob age:30 email:bob@example.com
+H user:100 email:bob@example.com age:30 name:Bob
