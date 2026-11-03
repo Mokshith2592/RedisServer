@@ -11,7 +11,7 @@ class RedisServer {
         void run();
 
         void shutdown();
-        
+
     private:
         int port;
         int server_socket;
@@ -19,6 +19,9 @@ class RedisServer {
 
         //Setup signal handling for graceful shutdown
         void setupSignalHandler();
+
+        // Serve one client until it disconnects or sends QUIT
+        void handleClient(int client_socket);
 };
 
-#endif 
+#endif

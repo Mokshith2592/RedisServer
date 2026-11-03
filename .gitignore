@@ -13,3 +13,8 @@ RedisClient
 threads.cpp
 
 my_redis_server
+database_tests
+command_handler_tests
+*.tmp
+
+claudeWritten

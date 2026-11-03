@@ -9,39 +9,100 @@ RedisDatabase& RedisDatabase::getInstance() {
     return instance;
 }
 
+static long long wallClockMs() {
+    return chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now().time_since_epoch()).count();
+}
+
 /*
 Memory -> File(Dump)
 File -> Memory(Load)
 
-K = Key Value
-L = List
-H = Hash
+Format v2 (binary safe, keeps TTLs):
+    MYRDB 2\n
+    <type> <expire-at-unix-ms | -1> <len>:<key> <count> <len>:<item> <len>:<item> ...\n
+
+K = Key Value   (count = 1, the value)
+L = List        (count = number of items)
+H = Hash        (count = 2 * fields, field/value alternating)
+S = Set         (count = number of members)
+
+Every string is length prefixed, so values may contain spaces, ':' or newlines.
+The old space separated format (v1) is still accepted by load().
 */
 
+static const string DUMP_HEADER = "MYRDB 2\n";
+
 bool RedisDatabase::dump(const string& filename) {
-    lock_guard<mutex> lock(db_mutex);
+    string data;
+    long long dirtyAtSnapshot = 0;
+    {
+        // Only hold the db lock while serializing, not while writing to disk.
+        lock_guard<mutex> lock(db_mutex);
+        dirtyAtSnapshot = dirty;
 
-    ofstream ofs(filename ,ios::binary);
-    if(!ofs) return false;
+        const auto steadyNow = chrono::steady_clock::now();
+        const long long wallNow = wallClockMs();
 
-    for(const auto &kv : kv_store) {
-        ofs << "K " << kv.first << " " << kv.second << "\n";
+        ostringstream out;
+        out << DUMP_HEADER;
+        auto writeStr = [&out](const string &s) { out << s.size() << ':' << s; };
+
+        for(const auto &entry : type_store) {
+            const string &key = entry.first;
+            long long expireAt = -1;
+            auto expIt = expiry_map.find(key);
+            if(expIt != expiry_map.end()) {
+                if(expIt->second <= steadyNow) continue;
+                expireAt = wallNow + chrono::duration_cast<chrono::milliseconds>(expIt->second - steadyNow).count();
+            }
+
+            if(entry.second == RedisType::STRING) {
+                auto it = kv_store.find(key);
+                if(it == kv_store.end()) continue;
+                out << "K " << expireAt << ' '; writeStr(key); out << " 1 "; writeStr(it->second);
+            }
+            else if(entry.second == RedisType::LIST) {
+                auto it = list_store.find(key);
+                if(it == list_store.end()) continue;
+                out << "L " << expireAt << ' '; writeStr(key); out << ' ' << it->second.size();
+                for(const auto &item : it->second) { out << ' '; writeStr(item); }
+            }
+            else if(entry.second == RedisType::HASH) {
+                auto it = hash_store.find(key);
+                if(it == hash_store.end()) continue;
+                out << "H " << expireAt << ' '; writeStr(key); out << ' ' << it->second.size() * 2;
+                for(const auto &field_val : it->second) {
+                    out << ' '; writeStr(field_val.first);
+                    out << ' '; writeStr(field_val.second);
+                }
+            }
+            else if(entry.second == RedisType::SET) {
+                auto it = set_store.find(key);
+                if(it == set_store.end()) continue;
+                out << "S " << expireAt << ' '; writeStr(key); out << ' ' << it->second.size();
+                for(const auto &member : it->second) { out << ' '; writeStr(member); }
+            }
+            out << '\n';
+        }
+        data = out.str();
     }
 
-    for(const auto &ls : list_store) {
-        ofs << "L " << ls.first;
-        for(const auto &item : ls.second) 
-            ofs << " " << item;
-        ofs << "\n";
+    // Write to a temp file and rename it, so a crash mid-write never corrupts the old dump.
+    lock_guard<mutex> fileLock(dump_mutex);
+    const string tmpFile = filename + ".tmp";
+    {
+        ofstream ofs(tmpFile ,ios::binary | ios::trunc);
+        if(!ofs) return false;
+        ofs.write(data.data() ,data.size());
+        ofs.flush();
+        if(!ofs) return false;
     }
+    error_code ec;
+    filesystem::rename(tmpFile ,filename ,ec);
+    if(ec) return false;
 
-    for(const auto &hs : hash_store) {
-        ofs << "H " << hs.first;
-        for(const auto &field_val : hs.second) 
-            ofs << " " << field_val.first << ":" << field_val.second;
-        ofs << "\n";
-    }
-
+    dirty -= dirtyAtSnapshot;
+    last_save = time(nullptr);
     return true;
 }
 
@@ -73,21 +134,111 @@ bool RedisDatabase::load(const string& filename) {
 
     ifstream ifs(filename ,ios::binary);
     if(!ifs) return false;
+    string data((istreambuf_iterator<char>(ifs)) ,istreambuf_iterator<char>());
 
-    kv_store.clear();
-    list_store.clear();
-    hash_store.clear();
-    expiry_map.clear();
-    type_store.clear();
+    // Keep the current data around so a corrupt file doesn't wipe the database.
+    auto kvBackup = move(kv_store);
+    auto listBackup = move(list_store);
+    auto hashBackup = move(hash_store);
+    auto setBackup = move(set_store);
+    auto expiryBackup = move(expiry_map);
+    auto typeBackup = move(type_store);
+    clearUnlocked();
 
+    const bool ok = data.compare(0 ,DUMP_HEADER.size() ,DUMP_HEADER) == 0 ? loadV2(data) : loadLegacy(data);
+    if(!ok) {
+        kv_store = move(kvBackup);
+        list_store = move(listBackup);
+        hash_store = move(hashBackup);
+        set_store = move(setBackup);
+        expiry_map = move(expiryBackup);
+        type_store = move(typeBackup);
+        return false;
+    }
+    dirty = 0;
+    return true;
+}
+
+bool RedisDatabase::loadV2(const string &data) {
+    size_t pos = DUMP_HEADER.size();
+    const size_t size = data.size();
+
+    auto expect = [&](char c) {
+        if(pos >= size || data[pos] != c) return false;
+        pos++;
+        return true;
+    };
+    auto readInt = [&](long long &n) {
+        size_t start = pos;
+        if(pos < size && data[pos] == '-') pos++;
+        while(pos < size && isdigit(static_cast<unsigned char>(data[pos]))) pos++;
+        return parseInteger(data.substr(start ,pos - start) ,n);
+    };
+    auto readStr = [&](string &s) {
+        long long len;
+        if(!readInt(len) || !expect(':') || len < 0 || pos + len > size) return false;
+        s = data.substr(pos ,len);
+        pos += len;
+        return true;
+    };
+
+    const auto steadyNow = chrono::steady_clock::now();
+    const long long wallNow = wallClockMs();
+
+    while(pos < size) {
+        char type = data[pos++];
+        long long expireAt ,count;
+        string key;
+        if(!expect(' ') || !readInt(expireAt) || !expect(' ') || !readStr(key) || !expect(' ') || !readInt(count) || count < 0)
+            return false;
+
+        vector<string> items;
+        for(long long i=0 ;i<count ;i++) {
+            string item;
+            if(!expect(' ') || !readStr(item)) return false;
+            items.push_back(move(item));
+        }
+        if(!expect('\n')) return false;
+
+        // Skip keys that expired while the server was offline
+        if(expireAt != -1 && expireAt <= wallNow) continue;
+
+        if(type == 'K' && items.size() == 1) {
+            kv_store[key] = items[0];
+            type_store[key] = RedisType::STRING;
+        }
+        else if(type == 'L') {
+            list_store[key] = deque<string>(items.begin() ,items.end());
+            type_store[key] = RedisType::LIST;
+        }
+        else if(type == 'H' && items.size() % 2 == 0) {
+            auto &hash = hash_store[key];
+            for(size_t i=0 ;i<items.size() ;i+=2) hash[items[i]] = items[i+1];
+            type_store[key] = RedisType::HASH;
+        }
+        else if(type == 'S') {
+            set_store[key] = unordered_set<string>(items.begin() ,items.end());
+            type_store[key] = RedisType::SET;
+        }
+        else return false;
+
+        if(expireAt != -1)
+            expiry_map[key] = steadyNow + chrono::milliseconds(expireAt - wallNow);
+    }
+    return true;
+}
+
+// Old v1 format: "K key value" / "L key a b c" / "H key f:v f:v"
+bool RedisDatabase::loadLegacy(const string &data) {
+    istringstream ifs(data);
 
     string line;
     while(getline(ifs ,line)) {
         istringstream iss(line);
         char type;
 
-        iss >> type;
-        
+        if(!(iss >> type)) continue;
+
         if(type == 'K') {
             string key ,value;
             iss >> key >> value;
@@ -101,7 +252,7 @@ bool RedisDatabase::load(const string& filename) {
 
             string item;
             deque<string> list;
-            while(iss >> item) 
+            while(iss >> item)
                 list.push_back(item);
 
             list_store[key] = list;
@@ -131,6 +282,38 @@ bool RedisDatabase::load(const string& filename) {
     return true;
 }
 
+void RedisDatabase::setDumpFile(const string &filename) {
+    lock_guard<mutex> lock(db_mutex);
+    dump_file = filename;
+}
+
+string RedisDatabase::getDumpFile() {
+    lock_guard<mutex> lock(db_mutex);
+    return dump_file;
+}
+
+//Stats
+void RedisDatabase::noteWrite() { dirty++; }
+long long RedisDatabase::changesSinceSave() const { return dirty; }
+long long RedisDatabase::lastSaveTime() const { return last_save; }
+
+long long RedisDatabase::expiredKeys() {
+    lock_guard<mutex> lock(db_mutex);
+    return expired_keys;
+}
+
+map<string ,size_t> RedisDatabase::typeCounts() {
+    lock_guard<mutex> lock(db_mutex);
+    map<string ,size_t> counts;
+    for(const auto &entry : type_store) counts[getString(entry.second)]++;
+    return counts;
+}
+
+size_t RedisDatabase::expiresCount() {
+    lock_guard<mutex> lock(db_mutex);
+    return expiry_map.size();
+}
+
 //Key - Value Operations
 
 //Helper fns
@@ -138,43 +321,145 @@ string RedisDatabase::getString(RedisType type) {
     if(type == RedisType::STRING) return "string";
     else if(type == RedisType::LIST) return "list";
     else if(type == RedisType::HASH) return "hash";
+    else if(type == RedisType::SET) return "set";
     else return "none";
 }
 
 bool RedisDatabase::checkExpiry(const string &key) {
-    if(expiry_map.find(key) != expiry_map.end() &&
-        expiry_map[key] <= chrono::steady_clock::now()) {
-        if(deleteUnlocked(key)) return true;
+    auto it = expiry_map.find(key);
+    if(it != expiry_map.end() && it->second <= chrono::steady_clock::now()) {
+        if(deleteUnlocked(key)) {
+            expired_keys++;
+            return true;
+        }
         else return false;
     }
     return false;
 }
 
-bool RedisDatabase::flushAll() {
-    lock_guard<mutex> lock(db_mutex);
+RedisType* RedisDatabase::findTypeUnlocked(const string &key) {
+    checkExpiry(key);
+    auto it = type_store.find(key);
+    return it == type_store.end() ? nullptr : &it->second;
+}
 
-    kv_store.clear();
-    list_store.clear();
-    hash_store.clear();
-    expiry_map.clear();
-    type_store.clear();
-
+// Strict integer parsing: the whole string must be a number ("12abc" is rejected)
+bool RedisDatabase::parseInteger(const string &str ,long long &value) {
+    if(str.empty() || str.size() > 20 || isspace(static_cast<unsigned char>(str[0]))) return false;
+    errno = 0;
+    char *end = nullptr;
+    long long parsed = strtoll(str.c_str() ,&end ,10);
+    if(errno == ERANGE || end != str.c_str() + str.size()) return false;
+    value = parsed;
     return true;
 }
 
-bool RedisDatabase::set(const string &key ,const string &value) {
+static bool parseLongDouble(const string &str ,long double &value) {
+    if(str.empty() || isspace(static_cast<unsigned char>(str[0]))) return false;
+    errno = 0;
+    char *end = nullptr;
+    long double parsed = strtold(str.c_str() ,&end);
+    if(errno == ERANGE || end != str.c_str() + str.size() || isnan(parsed)) return false;
+    value = parsed;
+    return true;
+}
+
+// Redis style glob matching used by KEYS: * ? [abc] [^a] [a-z] and \ escapes
+static bool globMatchFrom(const string &p ,size_t pi ,const string &s ,size_t si) {
+    while(pi < p.size()) {
+        char c = p[pi];
+        if(c == '*') {
+            while(pi < p.size() && p[pi] == '*') pi++;
+            if(pi == p.size()) return true;
+            for(; si <= s.size(); si++)
+                if(globMatchFrom(p ,pi ,s ,si)) return true;
+            return false;
+        }
+        if(si >= s.size()) return false;
+
+        if(c == '?') { pi++; si++; continue; }
+
+        if(c == '[') {
+            size_t j = pi + 1;
+            bool negate = j < p.size() && p[j] == '^';
+            if(negate) j++;
+            bool matched = false;
+            while(j < p.size() && p[j] != ']') {
+                if(p[j] == '\\' && j + 1 < p.size()) {
+                    j++;
+                    if(p[j] == s[si]) matched = true;
+                }
+                else if(j + 2 < p.size() && p[j+1] == '-' && p[j+2] != ']') {
+                    char lo = p[j] ,hi = p[j+2];
+                    if(lo > hi) swap(lo ,hi);
+                    if(s[si] >= lo && s[si] <= hi) matched = true;
+                    j += 2;
+                }
+                else if(p[j] == s[si]) matched = true;
+                j++;
+            }
+            if(j >= p.size()) {
+                // No closing bracket: treat '[' as a literal character
+                if(s[si] != '[') return false;
+                pi++; si++;
+                continue;
+            }
+            if(matched == negate) return false;
+            pi = j + 1; si++;
+            continue;
+        }
+
+        if(c == '\\' && pi + 1 < p.size()) c = p[++pi];
+        if(c != s[si]) return false;
+        pi++; si++;
+    }
+    return si == s.size();
+}
+
+bool RedisDatabase::globMatch(const string &pattern ,const string &str) {
+    return globMatchFrom(pattern ,0 ,str ,0);
+}
+
+void RedisDatabase::clearUnlocked() {
+    kv_store.clear();
+    list_store.clear();
+    hash_store.clear();
+    set_store.clear();
+    expiry_map.clear();
+    type_store.clear();
+}
+
+bool RedisDatabase::flushAll() {
+    lock_guard<mutex> lock(db_mutex);
+    clearUnlocked();
+    return true;
+}
+
+size_t RedisDatabase::dbSize() {
+    lock_guard<mutex> lock(db_mutex);
+    size_t count = 0;
+    const auto now = chrono::steady_clock::now();
+    for(const auto &entry : type_store) {
+        auto expIt = expiry_map.find(entry.first);
+        if(expIt == expiry_map.end() || expIt->second > now) count++;
+    }
+    return count;
+}
+
+// SET overwrites any existing key (of any type) and clears its TTL, like Redis.
+bool RedisDatabase::set(const string &key ,const string &value ,long long ttlMs ,SetCondition cond) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(type_store.find(key) == type_store.end()) {
-        kv_store[key] = value;
-        type_store[key] = RedisType::STRING;
+    const bool exists = findTypeUnlocked(key) != nullptr;
+    if(cond == SetCondition::NX && exists) return false;
+    if(cond == SetCondition::XX && !exists) return false;
 
-        return true;
-    }  
-    else {
-        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
-        return false;
-    }
+    if(exists) deleteUnlocked(key);
+    kv_store[key] = value;
+    type_store[key] = RedisType::STRING;
+    if(ttlMs > 0) expiry_map[key] = chrono::steady_clock::now() + chrono::milliseconds(ttlMs);
+
+    return true;
 }
 
 bool RedisDatabase::get(const string &key ,string &value) {
@@ -187,60 +472,159 @@ bool RedisDatabase::get(const string &key ,string &value) {
 
     if(type_store.find(key) != type_store.end()) {
         string type = getString(type_store[key]);
-        if(type == "list") {
-            cerr << "The key: " << key << " is present as a List\n";
-            return false;
-        }
-        else if(type == "hash") {
-            cerr << "The key: " << key << " is present as a hash\n";
+        if(type != "string") {
+            cerr << "The key: " << key << " is present as a " << type << "\n";
             return false;
         }
     }
 
     auto itr = kv_store.find(key);
-    if(itr == kv_store.end()) {
-        cerr << "The key: " << key << " is not present in database\n";
-        return false;
-    }
+    if(itr == kv_store.end()) return false;
 
     value = itr -> second;
     return true;
 }
 
-vector<string> RedisDatabase::keys() {
+void RedisDatabase::mset(const vector<pair<string ,string>> &keyValues) {
+    lock_guard<mutex> lock(db_mutex);
+    for(const auto &kv : keyValues) {
+        deleteUnlocked(kv.first);
+        kv_store[kv.first] = kv.second;
+        type_store[kv.first] = RedisType::STRING;
+    }
+}
+
+OpStatus RedisDatabase::getSet(const string &key ,const string &value ,string &oldValue) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+
+    OpStatus status = type ? OpStatus::OK : OpStatus::NOT_FOUND;
+    if(type) oldValue = kv_store[key];
+    kv_store[key] = value;
+    type_store[key] = RedisType::STRING;
+    expiry_map.erase(key);
+    return status;
+}
+
+OpStatus RedisDatabase::getDel(const string &key ,string &value) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::NOT_FOUND;
+    if(*type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+    value = kv_store[key];
+    deleteUnlocked(key);
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::incrBy(const string &key ,long long delta ,long long &result) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+
+    long long current = 0;
+    if(type && !parseInteger(kv_store[key] ,current)) return OpStatus::NOT_INTEGER;
+    if(__builtin_add_overflow(current ,delta ,&result)) return OpStatus::OVERFLOW;
+
+    kv_store[key] = to_string(result);
+    type_store[key] = RedisType::STRING;
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::incrByFloat(const string &key ,long double delta ,string &result) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+
+    long double current = 0;
+    if(type && !parseLongDouble(kv_store[key] ,current)) return OpStatus::NOT_FLOAT;
+    long double updated = current + delta;
+    if(isnan(updated) || isinf(updated)) return OpStatus::NOT_FLOAT;
+
+    char buffer[64];
+    snprintf(buffer ,sizeof(buffer) ,"%.17Lg" ,updated);
+    result = buffer;
+    kv_store[key] = result;
+    type_store[key] = RedisType::STRING;
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::append(const string &key ,const string &value ,size_t &newLength) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+
+    string &current = kv_store[key];
+    current += value;
+    type_store[key] = RedisType::STRING;
+    newLength = current.size();
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::stringLength(const string &key ,size_t &length) {
+    lock_guard<mutex> lock(db_mutex);
+    length = 0;
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::OK;
+    if(*type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+    length = kv_store[key].size();
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::getRange(const string &key ,long long start ,long long end ,string &result) {
+    lock_guard<mutex> lock(db_mutex);
+    result.clear();
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::OK;
+    if(*type != RedisType::STRING) return OpStatus::WRONG_TYPE;
+
+    const string &value = kv_store[key];
+    const long long size = static_cast<long long>(value.size());
+    if(start < 0) start = size + start;
+    if(end < 0) end = size + end;
+    start = max(0LL ,start);
+    end = max(0LL ,end);
+    end = min(end ,size - 1);
+    if(size == 0 || start > end) return OpStatus::OK;
+    result = value.substr(start ,end - start + 1);
+    return OpStatus::OK;
+}
+
+vector<string> RedisDatabase::keys(const string &pattern) {
     lock_guard<mutex> lock(db_mutex);
 
     vector<string> result;
-    // for(const auto &pair : kv_store) {
-    //     result.push_back(pair.first);
-    // }
-    // for(const auto &pair : list_store) {
-    //     result.push_back(pair.first);
-    // }
-    // for(const auto &pair : hash_store) {
-    //     result.push_back(pair.first);
-    // }
+    vector<string> expired;
+    const auto now = chrono::steady_clock::now();
 
     for(auto &pair : type_store) {
-        result.push_back(pair.first);
+        auto expIt = expiry_map.find(pair.first);
+        if(expIt != expiry_map.end() && expIt->second <= now) {
+            expired.push_back(pair.first);
+            continue;
+        }
+        if(globMatch(pattern ,pair.first)) result.push_back(pair.first);
     }
 
+    for(const string &key : expired) {
+        deleteUnlocked(key);
+        expired_keys++;
+    }
+
+    sort(result.begin() ,result.end());
     return result;
 }
 
 string RedisDatabase::type(const string &key) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return "none";
-    }
+    RedisType *type = findTypeUnlocked(key);
+    return type ? getString(*type) : "none";
+}
 
-    string ans = "";
-    if(type_store.find(key) != type_store.end()) ans = getString(type_store[key]);
-    else ans = "none";
-
-    return ans;
+bool RedisDatabase::exists(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+    return findTypeUnlocked(key) != nullptr;
 }
 
 bool RedisDatabase::deleteUnlocked(const string &key) {
@@ -248,6 +632,7 @@ bool RedisDatabase::deleteUnlocked(const string &key) {
     erased |= (kv_store.erase(key) > 0);
     erased |= (list_store.erase(key) > 0);
     erased |= (hash_store.erase(key) > 0);
+    erased |= (set_store.erase(key) > 0);
     erased |= (expiry_map.erase(key) > 0);
     erased |= (type_store.erase(key) > 0);
 
@@ -256,18 +641,44 @@ bool RedisDatabase::deleteUnlocked(const string &key) {
 
 bool RedisDatabase::del(const string &key) {
     lock_guard<mutex> lock(db_mutex);
-    return deleteUnlocked(key);    
+    if(checkExpiry(key)) return false;
+    return deleteUnlocked(key);
 }
 
 bool RedisDatabase::expire(const string &key ,int seconds) {
+    return pexpire(key ,static_cast<long long>(seconds) * 1000);
+}
+
+bool RedisDatabase::pexpire(const string &key ,long long milliseconds) {
     lock_guard<mutex> lock(db_mutex);
 
-    bool exist = (type_store.find(key) != type_store.end());
+    if(!findTypeUnlocked(key)) return false;
 
-    if(!exist) return false;
+    // A non-positive TTL deletes the key right away (same as Redis)
+    if(milliseconds <= 0) {
+        deleteUnlocked(key);
+        return true;
+    }
 
-    expiry_map[key] = chrono::steady_clock::now() + chrono::seconds(seconds);
+    expiry_map[key] = chrono::steady_clock::now() + chrono::milliseconds(milliseconds);
     return true;
+}
+
+long long RedisDatabase::pttl(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    if(!findTypeUnlocked(key)) return -2;
+    auto it = expiry_map.find(key);
+    if(it == expiry_map.end()) return -1;
+
+    auto left = chrono::duration_cast<chrono::milliseconds>(it->second - chrono::steady_clock::now()).count();
+    return max<long long>(0 ,left);
+}
+
+bool RedisDatabase::persist(const string &key) {
+    lock_guard<mutex> lock(db_mutex);
+    if(!findTypeUnlocked(key)) return false;
+    return expiry_map.erase(key) > 0;
 }
 
 bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
@@ -279,16 +690,12 @@ bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
     }
 
     const bool exists = kv_store.count(oldKey) || list_store.count(oldKey) ||
-                        hash_store.count(oldKey);
+                        hash_store.count(oldKey) || set_store.count(oldKey);
     if(!exists) return false;
 
     if(oldKey == newKey) return true;
 
-    kv_store.erase(newKey);
-    list_store.erase(newKey);
-    hash_store.erase(newKey);
-    expiry_map.erase(newKey);
-    type_store.erase(newKey);
+    deleteUnlocked(newKey);
 
     auto itrKv = kv_store.find(oldKey);
     if(itrKv != kv_store.end()) {
@@ -314,35 +721,73 @@ bool RedisDatabase::rename(const string &oldKey ,const string &newKey) {
         type_store[newKey] = RedisType::HASH;
     }
 
+    auto itrSet = set_store.find(oldKey);
+    if(itrSet != set_store.end()) {
+        set_store.emplace(newKey, move(itrSet->second));
+        set_store.erase(itrSet);
+
+        type_store[newKey] = RedisType::SET;
+    }
+
     auto itrExpiry = expiry_map.find(oldKey);
     if(itrExpiry != expiry_map.end()) {
         expiry_map.emplace(newKey, itrExpiry->second);
         expiry_map.erase(itrExpiry);
     }
 
+    type_store.erase(oldKey);
     return true;
+}
+
+bool RedisDatabase::randomKey(string &key) {
+    lock_guard<mutex> lock(db_mutex);
+
+    // A few attempts in case we keep landing on expired keys
+    for(int attempt = 0; attempt < 100 && !type_store.empty(); attempt++) {
+        auto it = type_store.begin();
+        advance(it ,rng() % type_store.size());
+        string candidate = it->first;
+        if(checkExpiry(candidate)) continue;
+        key = candidate;
+        return true;
+    }
+    return false;
+}
+
+int RedisDatabase::purgeExpired(int maxKeys) {
+    lock_guard<mutex> lock(db_mutex);
+
+    const auto now = chrono::steady_clock::now();
+    vector<string> victims;
+    for(const auto &entry : expiry_map) {
+        if(entry.second <= now) {
+            victims.push_back(entry.first);
+            if(static_cast<int>(victims.size()) >= maxKeys) break;
+        }
+    }
+
+    for(const string &key : victims) deleteUnlocked(key);
+    expired_keys += victims.size();
+    return static_cast<int>(victims.size());
 }
 
 //List Operations
 string RedisDatabase::lpush(const string &key ,const vector<string> &values) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return "0";
-    }
+    checkExpiry(key);
 
-    if(((type_store.find(key) != type_store.end()) && (type_store[key] == RedisType::LIST)) || 
+    if(((type_store.find(key) != type_store.end()) && (type_store[key] == RedisType::LIST)) ||
             (type_store.find(key) == type_store.end())) {
         deque<string> &currValues = list_store[key];
-        
+
         for(const string &i : values) currValues.push_front(i);
         type_store[key] = RedisType::LIST;
 
         return to_string(currValues.size());
     }
 
-    if(type_store[key] != RedisType::LIST) 
+    if(type_store[key] != RedisType::LIST)
         cerr << "The key is already set as " << getString(type_store[key]) << "\n";
 
     return "0";
@@ -351,100 +796,58 @@ string RedisDatabase::lpush(const string &key ,const vector<string> &values) {
 string RedisDatabase::rpush(const string &key ,const vector<string> &values) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return "0";
-    }
+    checkExpiry(key);
 
-    if(((type_store.find(key) != type_store.end()) && (type_store[key] == RedisType::LIST)) || 
+    if(((type_store.find(key) != type_store.end()) && (type_store[key] == RedisType::LIST)) ||
             (type_store.find(key) == type_store.end())) {
         deque<string> &currValues = list_store[key];
-        
+
         for(const string &i : values) currValues.push_back(i);
         type_store[key] = RedisType::LIST;
 
         return to_string(currValues.size());
     }
 
-    if(type_store[key] != RedisType::LIST) 
+    if(type_store[key] != RedisType::LIST)
         cerr << "The key is already set as " << getString(type_store[key]) << "\n";
-        
+
     return "0";
 }
 
-string RedisDatabase::lpop(const string &key) {
-    lock_guard<mutex> lock(db_mutex);
+OpStatus RedisDatabase::popUnlocked(const string &key ,int count ,bool fromFront ,vector<string> &values) {
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::NOT_FOUND;
+    if(*type != RedisType::LIST) return OpStatus::WRONG_TYPE;
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return "0";
-    }
-
-    if((type_store.find(key) == type_store.end())) {
-        cerr << "The key " << key << " does not exisit\r\n";
-        return "0";
-    }
-    
-    if(type_store[key] != RedisType::LIST) {
-        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
-        return "0";
+    deque<string> &list = list_store[key];
+    for(int i=0 ;i<count && !list.empty() ;i++) {
+        if(fromFront) { values.push_back(move(list.front())); list.pop_front(); }
+        else { values.push_back(move(list.back())); list.pop_back(); }
     }
 
-    deque<string> &currValue = list_store[key];
-    if(currValue.size() > 0) {
-        currValue.pop_front();
-        if(currValue.size()  == 0) deleteUnlocked(key);
-    }
-    else {
-        cerr << "The key " << key << " doesnt have enough elements\r\n";
-        return "-1";
-    }
-
-    return to_string(currValue.size());
+    // Empty lists are removed. Nothing touches `list` after this point.
+    if(list.empty()) deleteUnlocked(key);
+    return OpStatus::OK;
 }
 
-string RedisDatabase::rpop(const string &key) {
+OpStatus RedisDatabase::lpop(const string &key ,int count ,vector<string> &values) {
     lock_guard<mutex> lock(db_mutex);
+    return popUnlocked(key ,count ,true ,values);
+}
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return "0";
-    }
-
-    if((type_store.find(key) == type_store.end())) {
-        cerr << "The key " << key << " does not exisit\r\n";
-        return "0";
-    }
-
-    if(type_store[key] != RedisType::LIST) {
-        cerr << "The key is already set as " << getString(type_store[key]) << "\n";
-        return "0";
-    }
-
-    deque<string> &currValue = list_store[key];
-    if(currValue.size() > 0) {
-        currValue.pop_back();
-        if(currValue.size()  == 0) deleteUnlocked(key);
-    }
-    else {
-        cerr << "The key " << key << " doesnt have enough elements\r\n";
-        return "-1";
-    }
-
-    return to_string(currValue.size());
+OpStatus RedisDatabase::rpop(const string &key ,int count ,vector<string> &values) {
+    lock_guard<mutex> lock(db_mutex);
+    return popUnlocked(key ,count ,false ,values);
 }
 
 string RedisDatabase::llen(const string &key) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return "0";
-    }
+    if(checkExpiry(key)) return "0";
 
     if((type_store.find(key) != type_store.end()) && (type_store[key] != RedisType::LIST)) {
         cerr << "The key is already set as " << getString(type_store[key]) << "\n";
-        return "0";
+        return "-1";
     }
 
     if(type_store.find(key) != type_store.end()) return to_string(list_store[key].size());
@@ -454,10 +857,7 @@ string RedisDatabase::llen(const string &key) {
 bool RedisDatabase::lrange(const string &key ,const int start ,const int end ,vector<string> &values) {
     lock_guard<mutex> lock(db_mutex);
 
-    if(checkExpiry(key)) {
-        cerr << key << " is expired\n";
-        return false;
-    }
+    if(checkExpiry(key)) return true;
 
     if((type_store.find(key) != type_store.end()) && (type_store[key] != RedisType::LIST)) {
         cerr << "The key is already set as " << getString(type_store[key]) << "\n";
@@ -466,7 +866,7 @@ bool RedisDatabase::lrange(const string &key ,const int start ,const int end ,ve
 
     if(type_store.find(key) != type_store.end()) {
         deque<string> &currValues = list_store[key];
-        
+
         const int size = static_cast<int>(currValues.size());
         int first = start < 0 ? size + start : start;
         int last = end < 0 ? size + end : end;
@@ -551,6 +951,22 @@ bool RedisDatabase::ltrim(const string &key, int start, int end) {
     return true;
 }
 
+// newLength: list length after insert, -1 if the pivot was not found
+OpStatus RedisDatabase::linsert(const string &key, bool before, const string &pivot, const string &value, long long &newLength) {
+    lock_guard<mutex> lock(db_mutex);
+    newLength = 0;
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::NOT_FOUND;
+    if(*type != RedisType::LIST) return OpStatus::WRONG_TYPE;
+
+    deque<string> &list = list_store[key];
+    auto it = find(list.begin(), list.end(), pivot);
+    if(it == list.end()) { newLength = -1; return OpStatus::OK; }
+    list.insert(before ? it : next(it), value);
+    newLength = static_cast<long long>(list.size());
+    return OpStatus::OK;
+}
+
 // Hash Operations
 bool RedisDatabase::hset(const string &key, const vector<pair<string, string>> &fieldValues, int &added) {
     lock_guard<mutex> lock(db_mutex);
@@ -566,6 +982,18 @@ bool RedisDatabase::hset(const string &key, const vector<pair<string, string>> &
     }
     type_store[key] = RedisType::HASH;
     return true;
+}
+
+OpStatus RedisDatabase::hsetnx(const string &key, const string &field, const string &value, bool &set) {
+    lock_guard<mutex> lock(db_mutex);
+    set = false;
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::HASH) return OpStatus::WRONG_TYPE;
+
+    unordered_map<string, string> &hash = hash_store[key];
+    type_store[key] = RedisType::HASH;
+    set = hash.emplace(field, value).second;
+    return OpStatus::OK;
 }
 
 bool RedisDatabase::hget(const string &key, const string &field, string &value) {
@@ -633,4 +1061,140 @@ bool RedisDatabase::hvals(const string &key, vector<string> &values) {
     if(!hgetall(key, fieldValues)) return false;
     for(const auto &fieldValue : fieldValues) values.push_back(fieldValue.second);
     return true;
+}
+
+OpStatus RedisDatabase::hincrBy(const string &key, const string &field, long long delta, long long &result) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::HASH) return OpStatus::WRONG_TYPE;
+
+    unordered_map<string, string> &hash = hash_store[key];
+    type_store[key] = RedisType::HASH;
+
+    long long current = 0;
+    auto fieldIt = hash.find(field);
+    if(fieldIt != hash.end() && !parseInteger(fieldIt->second, current)) return OpStatus::NOT_INTEGER;
+    if(__builtin_add_overflow(current, delta, &result)) return OpStatus::OVERFLOW;
+    hash[field] = to_string(result);
+    return OpStatus::OK;
+}
+
+// Set Operations
+OpStatus RedisDatabase::sadd(const string &key, const vector<string> &members, int &added) {
+    lock_guard<mutex> lock(db_mutex);
+    added = 0;
+    RedisType *type = findTypeUnlocked(key);
+    if(type && *type != RedisType::SET) return OpStatus::WRONG_TYPE;
+
+    unordered_set<string> &set = set_store[key];
+    for(const string &member : members) added += set.insert(member).second;
+    type_store[key] = RedisType::SET;
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::srem(const string &key, const vector<string> &members, int &removed) {
+    lock_guard<mutex> lock(db_mutex);
+    removed = 0;
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::OK;
+    if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+
+    unordered_set<string> &set = set_store[key];
+    for(const string &member : members) removed += set.erase(member) > 0;
+    if(set.empty()) deleteUnlocked(key);
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::sismember(const string &key, const string &member, bool &isMember) {
+    lock_guard<mutex> lock(db_mutex);
+    isMember = false;
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::OK;
+    if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+    isMember = set_store[key].count(member) > 0;
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::smembers(const string &key, vector<string> &members) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::OK;
+    if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+    const unordered_set<string> &set = set_store[key];
+    members.assign(set.begin(), set.end());
+    sort(members.begin(), members.end());
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::scard(const string &key, size_t &count) {
+    lock_guard<mutex> lock(db_mutex);
+    count = 0;
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::OK;
+    if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+    count = set_store[key].size();
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::spop(const string &key, int count, vector<string> &members) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::NOT_FOUND;
+    if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+
+    unordered_set<string> &set = set_store[key];
+    for(int i=0 ;i<count && !set.empty() ;i++) {
+        auto it = set.begin();
+        advance(it, rng() % set.size());
+        members.push_back(*it);
+        set.erase(it);
+    }
+    if(set.empty()) deleteUnlocked(key);
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::srandmember(const string &key, string &member) {
+    lock_guard<mutex> lock(db_mutex);
+    RedisType *type = findTypeUnlocked(key);
+    if(!type) return OpStatus::NOT_FOUND;
+    if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+
+    const unordered_set<string> &set = set_store[key];
+    auto it = set.begin();
+    advance(it, rng() % set.size());
+    member = *it;
+    return OpStatus::OK;
+}
+
+OpStatus RedisDatabase::setOperation(char op, const vector<string> &keys, vector<string> &result) {
+    lock_guard<mutex> lock(db_mutex);
+
+    // Missing keys behave like empty sets
+    static const unordered_set<string> emptySet;
+    vector<const unordered_set<string>*> sets;
+    for(const string &key : keys) {
+        RedisType *type = findTypeUnlocked(key);
+        if(!type) { sets.push_back(&emptySet); continue; }
+        if(*type != RedisType::SET) return OpStatus::WRONG_TYPE;
+        sets.push_back(&set_store[key]);
+    }
+    if(sets.empty()) return OpStatus::OK;
+
+    if(op == 'U') {
+        unordered_set<string> merged;
+        for(const auto *set : sets) merged.insert(set->begin(), set->end());
+        result.assign(merged.begin(), merged.end());
+    }
+    else {
+        for(const string &member : *sets[0]) {
+            bool keep = true;
+            for(size_t i=1 ;i<sets.size() && keep ;i++) {
+                const bool inOther = sets[i]->count(member) > 0;
+                keep = (op == 'I') ? inOther : !inOther;
+            }
+            if(keep) result.push_back(member);
+        }
+    }
+    sort(result.begin(), result.end());
+    return OpStatus::OK;
 }
